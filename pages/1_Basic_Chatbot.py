@@ -1,5 +1,5 @@
 """
-Basic Chatbot with LangGraph
+Build PromptGenerator with LangGraph
 """
 
 # =============================================================================
@@ -8,11 +8,16 @@ Basic Chatbot with LangGraph
 
 import streamlit as st
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from typing import Annotated
 from typing_extensions import TypedDict
+
+# Pydantic: For defining data structures
+from pydantic import BaseModel
+from typing import List, Literal, TypedDict
+from langchain_core.messages import BaseMessage
 
 
 # =============================================================================
@@ -20,7 +25,7 @@ from typing_extensions import TypedDict
 # =============================================================================
 
 st.set_page_config(
-    page_title="Basic Chatbot",
+    page_title="Prompt Generator",
     page_icon=None,
     layout="centered"
 )
@@ -74,9 +79,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="page-title">Basic AI Chat</div>', unsafe_allow_html=True)
-st.markdown('<div class="page-caption">A friendly AI assistant that chats with you.</div>', unsafe_allow_html=True)
+st.markdown('<div class="page-title">AI Prompt Generator</div>', unsafe_allow_html=True)
+st.markdown('<div class="page-caption">A friendly AI assistant that can help you generate prompts.</div>', unsafe_allow_html=True)
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+
+# Define LangGraph state
+class State(TypedDict):
+    messages: List[BaseMessage]
 
 
 # =============================================================================
@@ -89,8 +99,8 @@ if "llm" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "chatbot" not in st.session_state:
-    st.session_state.chatbot = None
+if "prompt_generator" not in st.session_state:
+    st.session_state.prompt_generator = None
 
 
 # =============================================================================
@@ -119,12 +129,12 @@ else:
 # =============================================================================
 
 with st.sidebar:
-    st.markdown("**Basic AI Chat**")
-    st.caption("Simple LLM conversation with no tools or retrieval.")
+    st.markdown("**Basic AI Prompt Generator**")
+    st.caption("Simple LLM conversation to generate prompt based on your goal, requirements, contraints and structure")
     st.divider()
     if st.button("Clear chat"):
         st.session_state.messages = []
-        st.session_state.chatbot = None
+        st.session_state.prompt_generator = None
         st.session_state.llm = None
         st.rerun()
     if st.button("Home"):
@@ -144,27 +154,133 @@ if not st.session_state.llm:
 
 
 # =============================================================================
-# BUILD CHATBOT GRAPH
+# BUILD 2-STATE PROMPT GENERATOR GRAPH
 # =============================================================================
 
-if st.session_state.llm and not st.session_state.chatbot:
+if st.session_state.llm and not st.session_state.prompt_generator:
 
-    class State(TypedDict):
-        messages: Annotated[list, add_messages]
+    # Define requirements structure
+    class PromptInstructions(BaseModel):
+        """Structure for collecting prompt requirements"""
+        objective: str
+        variables: List[str]
+        constraints: List[str]
+        requirements: List[str]
+    
+    # Bind tool to LLM
+    llm_with_tool = st.session_state.llm.bind_tools([PromptInstructions])
 
-    def chatbot_node(state: State):
-        system_msg = SystemMessage(
-            content="You are a helpful and friendly AI assistant. Have natural conversations with users."
-        )
-        messages = [system_msg] + state["messages"]
+    # STATE 1: Gather requirements through conversation
+    def gather_requirements(state: State):
+        """Ask questions to understand what prompt the user needs"""
+        system_prompt = """Help the user create a custom AI prompt through friendly conversation.
+
+        You need to understand:
+        1. Purpose: What do they want the AI to help with?
+        2. Information needed: What details will they provide each time?
+        3. Things to avoid: What should the AI NOT do?
+        4. Must include: What should the AI always do?
+
+        RULES:
+        - Ask ONE question at a time in plain language
+        - No technical terms like variables or parameters
+        - Be conversational and friendly
+
+        When you have all information, call the tool."""
+        
+        messages = [SystemMessage(content=system_prompt)] + state["messages"]
+        response = llm_with_tool.invoke(messages)
+        return {"messages": [response]}
+
+    # Transition node between states
+    def add_tool_message(state: State):
+        """Add confirmation message after requirements are collected"""
+        tool_call_id = state["messages"][-1].tool_calls[0]["id"]
+        return {
+            "messages": [
+                ToolMessage(
+                    content="Requirements collected! Generating prompt...",
+                    tool_call_id=tool_call_id
+                )
+            ]
+        }
+
+    # STATE 2: Generate the actual prompt
+    def generate_prompt(state: State):
+        """Create a professional prompt based on collected requirements"""
+        tool_args = None
+        post_tool_messages = []
+        
+        # Extract requirements from tool call
+        for msg in state["messages"]:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                tool_args = msg.tool_calls[0]["args"]
+            elif isinstance(msg, ToolMessage):
+                continue
+            elif tool_args:
+                post_tool_messages.append(msg)
+        
+        if tool_args:
+            requirements_text = f"""
+            Objective: {tool_args.get('objective', 'Not specified')}
+            Variables: {', '.join(tool_args.get('variables', []))}
+            Constraints: {', '.join(tool_args.get('constraints', []))}
+            Requirements: {', '.join(tool_args.get('requirements', []))}
+            """
+            
+            system_msg = SystemMessage(content=f"""Create a prompt template based on:
+
+            {requirements_text}
+
+            Guidelines:
+            - Make it clear and specific
+            - Use {{{{variable_name}}}} format for variables
+            - Address all constraints and requirements
+            - Use professional prompt engineering techniques""")
+            
+            messages = [system_msg] + post_tool_messages
+        else:
+            messages = post_tool_messages
+        
         response = st.session_state.llm.invoke(messages)
         return {"messages": [response]}
 
+    # Router to decide which state to go to
+    def route_conversation(state: State) -> Literal["add_tool_message", "gather", "__end__"]:
+        """Decide what to do next based on current state"""
+        last_msg = state["messages"][-1]
+        
+        if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+            return "add_tool_message"  # Requirements collected, transition to generate
+        elif not isinstance(last_msg, HumanMessage):
+            return "__end__"  # Done
+        else:
+            return "gather"  # Keep gathering requirements
+    
+    # Build workflow
     workflow = StateGraph(State)
-    workflow.add_node("chatbot", chatbot_node)
-    workflow.add_edge(START, "chatbot")
-    workflow.add_edge("chatbot", END)
-    st.session_state.chatbot = workflow.compile()
+    
+    # Add nodes
+    workflow.add_node("gather", gather_requirements)
+    workflow.add_node("add_tool_message", add_tool_message)
+    workflow.add_node("generate", generate_prompt)
+    
+    # Add edges
+    workflow.add_edge(START, "gather")
+    workflow.add_conditional_edges(
+        "gather",
+        route_conversation,
+        {
+            "add_tool_message": "add_tool_message",
+            "gather": "gather",
+            "__end__": END
+        }
+    )
+    workflow.add_edge("add_tool_message", "generate")
+    workflow.add_edge("generate", END)
+    
+    # Compile and save
+    st.session_state.prompt_generator = workflow.compile()
 
 
 # =============================================================================
@@ -173,7 +289,7 @@ if st.session_state.llm and not st.session_state.chatbot:
 
 if not st.session_state.messages:
     greeting = "Hi! My name is Assistant. What can I do for you today?"
-    st.session_state.messages.append({"role": "assistant", "content": greeting})
+    st.session_state.messages.append({"role": "assistant", "content": greeting, "is_greeting": True})
 
 # =============================================================================
 # CHAT HISTORY
@@ -201,10 +317,10 @@ if user_input:
             for msg in st.session_state.messages:
                 if msg["role"] == "user":
                     messages.append(HumanMessage(content=msg["content"]))
-                else:
-                    messages.append(AIMessage(content=msg["content"]))
+                elif msg.get("role") == "assistant" and not msg.get("is_greeting"):
+                    messages.append(AIMessage(content=msg["content"]))            
 
-            result = st.session_state.chatbot.invoke({"messages": messages})
+            result = st.session_state.prompt_generator.invoke({"messages": messages})
             response = result["messages"][-1].content
 
             st.write(response)
