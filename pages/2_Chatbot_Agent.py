@@ -13,6 +13,9 @@ import os
 
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
+# Wikipedia and ArXiv: Tools for encyclopedia and research papers
+from langchain_community.tools import WikipediaQueryRun, ArxivQueryRun
+from langchain_community.utilities import WikipediaAPIWrapper, ArxivAPIWrapper
 from langgraph.prebuilt import create_react_agent
 
 _MD_LINK = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
@@ -100,8 +103,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="page-title">Search-Enabled Chat</div>', unsafe_allow_html=True)
-st.markdown('<div class="page-caption">AI agent with live web search capabilities via Tavily.</div>', unsafe_allow_html=True)
+st.markdown('<div class="page-title">Multi-Tool Chatbot Agent</div>', unsafe_allow_html=True)
+st.markdown('<div class="page-caption">Multi-Tool Chatbot Agent</div>', unsafe_allow_html=True)
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
 
@@ -153,12 +156,18 @@ with st.sidebar:
     st.markdown("**Search-Enabled Chat**")
     st.caption("AI agent with live web search via Tavily.")
     st.divider()
-    if st.button("Clear chat"):
-        st.session_state.agent_messages = []
-        st.session_state.agent = None
-        st.rerun()
-    if st.button("Home"):
-        st.switch_page("Home.py")
+    if st.session_state.openai_key and st.session_state.tavily_key:
+        st.subheader("🛠️ Available Tools")
+        st.write("✅ **Tavily Search** - Web search")
+        st.write("✅ **Wikipedia** - Encyclopedia")
+        st.write("✅ **ArXiv** - Research papers")
+    
+    if st.session_state.openai_key or st.session_state.tavily_key:
+        if st.button("Change API Keys"):
+            # Reset everything to start fresh
+            st.session_state.openai_key = ""
+            st.session_state.tavily_key = ""
+            st.rerun()
 
 
 # =============================================================================
@@ -171,16 +180,38 @@ if not st.session_state.agent:
 
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-    search_tool = TavilySearch(
-        max_results=5,
-        description=(
-            "Search the live web for up-to-date information, "
-            "latest figures, prices, releases, sports scores, or anything that may have "
-            "changed after the model's knowledge cutoff. Input should always be a search query string."
-        ),
-    )
+    # Create Tavily search tool
+    search_tool = TavilySearch(max_results=3)
+    
 
-    st.session_state.agent = create_react_agent(llm, [search_tool])
+
+    # Create Wikipedia tool
+    wikipedia = WikipediaQueryRun(
+        api_wrapper=WikipediaAPIWrapper(
+            top_k_results=2,
+            doc_content_chars_max=500
+        ),
+        name="wikipedia",
+        description="""Search Wikipedia for encyclopedia articles, historical information, 
+        biographies, and general knowledge. Best for: 'Who was...', 'What is...', 
+        'History of...', 'Explain...' queries."""
+    )
+    
+    # Create ArXiv tool
+    arxiv = ArxivQueryRun(
+        api_wrapper=ArxivAPIWrapper(
+            top_k_results=2,
+            doc_content_chars_max=500
+        ),
+        name="arxiv",
+        description="""Search ArXiv for academic papers, research articles, and scientific 
+        publications. Best for: 'Latest research on...', 'Papers about...', 
+        'Scientific studies on...' queries."""
+    )
+    
+    # Create agent with all tools
+    tools = [search_tool, wikipedia, arxiv]
+    st.session_state.agent = create_react_agent(llm, tools)
 
 
 # =============================================================================
@@ -201,6 +232,7 @@ for message in st.session_state.agent_messages:
             _render_assistant_text(message["content"])
         else:
             st.write(message["content"])
+print(st.session_state)
 
 
 # =============================================================================
