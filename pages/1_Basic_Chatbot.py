@@ -86,7 +86,7 @@ st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
 # Define LangGraph state
 class State(TypedDict):
-    messages: List[BaseMessage]
+    messages: Annotated[List[BaseMessage], add_messages]
 
 
 # =============================================================================
@@ -193,17 +193,22 @@ if st.session_state.llm and not st.session_state.prompt_generator:
         return {"messages": [response]}
 
     # Transition node between states
-    def add_tool_message(state: State):
+    def add_tool_message(state: State):        
         """Add confirmation message after requirements are collected"""
-        tool_call_id = state["messages"][-1].tool_calls[0]["id"]
-        return {
-            "messages": [
-                ToolMessage(
-                    content="Requirements collected! Generating prompt...",
-                    tool_call_id=tool_call_id
-                )
-            ]
-        }
+        last_msg = state["messages"][-1]
+        if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+            tool_call_id = last_msg.tool_calls[0]["id"]
+            return {
+                "messages": [
+                    ToolMessage(
+                        content="Requirements collected! Generating prompt...",
+                        tool_call_id=tool_call_id
+                    )
+                ]
+            }
+        else:
+            # Fallback if no tool call is present (should not happen due to routing)
+            return {"messages": []}
 
     # STATE 2: Generate the actual prompt
     def generate_prompt(state: State):
