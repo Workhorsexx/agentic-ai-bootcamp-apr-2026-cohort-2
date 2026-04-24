@@ -15,6 +15,11 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+# LangGraph: For building agentic workflows
+from langgraph.graph import StateGraph, START, END
+from typing_extensions import TypedDict
+from typing import Literal
+
 
 # =============================================================================
 # PAGE SETUP
@@ -96,6 +101,9 @@ if "rag_messages" not in st.session_state:
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = []
 
+if "rag_agent" not in st.session_state:
+    st.session_state.rag_agent = None  # Store the agentic RAG workflow
+
 
 # =============================================================================
 # CHECK API KEY FROM HOME PAGE
@@ -123,8 +131,8 @@ else:
 # =============================================================================
 
 with st.sidebar:
-    st.markdown("**RAG — Chat with your Data**")
-    st.caption("Ask questions grounded in your uploaded documents.")
+    st.title("📚 Chat with your Data (Agentic RAG)")
+    st.caption("AI agent that intelligently searches and answers from your documents")
     st.divider()
     if st.button("Clear chat"):
         st.session_state.rag_messages = []
@@ -134,6 +142,7 @@ with st.sidebar:
         st.session_state.rag_llm = None
         st.session_state.rag_messages = []
         st.session_state.processed_files = []
+        st.session_state.rag_agent = None
         st.rerun()
     if st.button("Home"):
         st.switch_page("Home.py")
@@ -186,6 +195,118 @@ if uploaded_files:
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
+# =============================================================================
+# CREATE AGENTIC RAG WORKFLOW
+# =============================================================================
+
+if st.session_state.vector_store and not st.session_state.rag_agent:
+    
+    # Define state structure for the workflow
+    class AgentState(TypedDict):
+        question: str  # User's question
+        documents: list  # Retrieved documents
+        generation: str  # Generated answer
+        steps: list  # Track what the agent does
+        rewrite_count: int  # Guard against infinite rewrite loops
+
+    # Node 1: Retrieve documents
+    def retrieve_documents(state: AgentState):
+        """Search documents for relevant information"""
+        question = state["question"]
+        retriever = st.session_state.vector_store.as_retriever()
+        docs = retriever.invoke(question)
+        
+        return {
+            "documents": docs,
+            "steps": state.get("steps", []) + ["📚 Retrieved documents"]
+        }
+
+    # Node 2: Grade document relevance
+    def grade_documents(state: AgentState) -> Literal["generate", "rewrite"]:
+            """Check if retrieved documents are actually relevant"""
+            question = state["question"]
+            docs = state["documents"]
+
+            if not docs:
+                return "generate"
+
+            if state.get("rewrite_count", 0) >= 3:
+                return "generate"
+
+            # Simple relevance check using LLM
+            prompt = f"""Are these documents relevant to the question: "{question}"?
+
+    Documents: {docs[0].page_content[:500]}
+
+    Answer with just 'yes' or 'no'."""
+
+            response = st.session_state.rag_llm.invoke(prompt)
+            is_relevant = "yes" in response.content.lower()
+
+            return "generate" if is_relevant else "rewrite"
+
+    # Node 3: Rewrite question
+    def rewrite_question(state: AgentState):
+        """Rewrite question for better search results"""
+        question = state["question"]
+
+        rewrite_prompt = f"Rewrite this question to be more specific and searchable: {question}"
+        new_question = st.session_state.rag_llm.invoke(rewrite_prompt).content
+
+        return {
+            "question": new_question,
+            "rewrite_count": state.get("rewrite_count", 0) + 1,
+            "steps": state["steps"] + [f"🔄 Rewrote question: {new_question}"]
+        }
+
+    # Node 4: Generate answer
+    def generate_answer(state: AgentState):
+        """Generate final answer from documents"""
+        question = state["question"]
+        docs = state["documents"]
+        
+        if not docs:
+            return {
+                "generation": "I couldn't find relevant information in the documents.",
+                "steps": state["steps"] + ["❌ No relevant documents found"]
+            }
+        
+        # Combine documents into context
+        context = "\n\n---\n\n".join(doc.page_content for doc in docs[:5])
+        
+        # Generate answer
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Answer the question using ONLY the provided context. Be concise and accurate. \
+            If you cannot generate an answer based on the context, say you don't know."),
+            ("human", "Question: {question}\n\nContext: {context}\n\nAnswer:")
+        ])
+        
+        response = st.session_state.rag_llm.invoke(
+            prompt.format_messages(question=question, context=context)
+        )
+        
+        return {
+            "generation": response.content,
+            "steps": state["steps"] + ["💬 Generated answer"]
+        }
+
+    # Build the workflow graph
+    workflow = StateGraph(AgentState)
+
+    # Add nodes
+    workflow.add_node("retrieve", retrieve_documents)
+    workflow.add_node("grade", grade_documents)
+    workflow.add_node("rewrite", rewrite_question)
+    workflow.add_node("generate", generate_answer)
+
+    # Define the flow
+    workflow.add_edge(START, "retrieve")
+    workflow.add_conditional_edges("retrieve", grade_documents)
+    workflow.add_edge("rewrite", "retrieve")  # After rewrite, retrieve again
+    workflow.add_edge("generate", END)
+
+    # Compile and save
+    st.session_state.rag_agent = workflow.compile()
 
 # =============================================================================
 # CHAT INTERFACE
@@ -209,28 +330,32 @@ if st.session_state.vector_store:
         with st.chat_message("user"):
             st.write(user_input)
 
+        # Generate response using agentic workflow
         with st.chat_message("assistant"):
-            with st.spinner("Searching documents..."):
-                retriever = st.session_state.vector_store.as_retriever()
-                docs = retriever.invoke(user_input)
-                context = "\n\n---\n\n".join(doc.page_content for doc in docs[:5])
-
-                if not context.strip():
-                    response_text = "I couldn't find relevant information in the uploaded documents."
-                else:
-                    prompt = ChatPromptTemplate.from_messages([
-                        ("system", "Answer the question using ONLY the provided context. Be concise and accurate."),
-                        ("human", "Question: {question}\n\nContext: {context}\n\nAnswer:")
-                    ])
-                    response = st.session_state.rag_llm.invoke(
-                        prompt.format_messages(question=user_input, context=context)
-                    )
-                    response_text = response.content
-
-                st.write(response_text)
+            with st.spinner("Agent is working..."):
+                
+                # Run the agentic workflow
+                result = st.session_state.rag_agent.invoke({
+                    "question": user_input,
+                    "documents": [],
+                    "generation": "",
+                    "steps": [],
+                    "rewrite_count": 0
+                })
+                
+                # Show agent's reasoning process
+                with st.expander("🤖 View Agent Process", expanded=False):
+                    st.markdown("### What the agent did:")
+                    for step in result["steps"]:
+                        st.markdown(f"- {step}")
+                
+                # Display final answer
+                st.write(result["generation"])
+                
+                # Save to history
                 st.session_state.rag_messages.append({
                     "role": "assistant",
-                    "content": response_text
+                    "content": result["generation"]
                 })
 
 else:
